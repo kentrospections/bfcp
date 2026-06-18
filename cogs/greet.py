@@ -38,13 +38,12 @@ class Greet(commands.Cog):
                     allowed_mentions=discord.AllowedMentions.all(),
                 )
 
-    # Set greet channel
     @greet_group.command(name="set-channel", description="Sets the greet channel")
-    async def create(
+    async def set_greet_channel(
         self,
         ctx,
         channel: discord.Option(
-            discord.TextChannel, "The channel to set as the green channel"
+            discord.TextChannel, "The channel to set as the greet channel"
         ),
     ):
         await ctx.defer()
@@ -52,7 +51,7 @@ class Greet(commands.Cog):
         guild_db = Guild()
         await guild_db.async_init(ctx.guild.id)
         if await guild_db.check_exists(ctx):
-            guild_db.set_greet_channel(channel.id)
+            await guild_db.set_greet_channel(channel.id)
             await ctx.send_followup(
                 embed=discord.Embed(
                     description=f"Greetings channel set to {channel.mention}.",
@@ -60,9 +59,8 @@ class Greet(commands.Cog):
                 )
             )
 
-    # Set greet message
     @greet_group.command(name="set-message", description="Sets the greet message")
-    async def create(
+    async def set_greet_message(
         self,
         ctx,
         message: discord.Option(str, "The greet message"),
@@ -72,7 +70,7 @@ class Greet(commands.Cog):
         guild_db = Guild()
         await guild_db.async_init(ctx.guild.id)
         if await guild_db.check_exists(ctx):
-            guild_db.set_greet_message(message)
+            await guild_db.set_greet_message(message)
             await ctx.send_followup(
                 embed=discord.Embed(
                     description="Greetings message set.",
@@ -80,12 +78,11 @@ class Greet(commands.Cog):
                 )
             )
 
-    # Add greet attachment
     @greet_group.command(
         name="add-attachment",
         description="Adds a greet attachment URL to the list of options to pick from randomly",
     )
-    async def create(
+    async def add_greet_attachment(
         self,
         ctx,
         url: discord.Option(str, "The greet attachment URL to add"),
@@ -103,12 +100,11 @@ class Greet(commands.Cog):
                 )
             )
 
-    # Remove greet attachment
     @greet_group.command(
         name="remove-attachment",
         description="Removes a greet attachment URL from the list of options to pick from randomly",
     )
-    async def create(
+    async def remove_greet_attachment(
         self,
         ctx,
         url: discord.Option(
