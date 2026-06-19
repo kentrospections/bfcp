@@ -1,13 +1,14 @@
 import discord
 
 from stuff.db import Guild, Space
+from stuff.spaces import space_overwrites
 
 
-async def _user_may_manage(interaction, space_db):
-    """True if the interaction user owns the space or has manage_channels / admin."""
-    if interaction.user.id == space_db.owner_id:
+def user_may_manage(member, space_db):
+    """True if the member owns the space or has manage_channels / admin."""
+    if member.id == space_db.owner_id:
         return True
-    perms = interaction.user.guild_permissions
+    perms = member.guild_permissions
     return perms.administrator or perms.manage_channels
 
 
@@ -104,243 +105,147 @@ class CreateSpaceModal(discord.ui.DesignerModal):
 
     async def callback(self, interaction):
         name = self.name_input.value or None
-        bump = self.bump_checkbox.value if self.bump_checkbox.value is not None else bool(self._guild_db.bump_on_message)
-        bump_thread = self.bump_thread_checkbox.value if self.bump_thread_checkbox.value is not None else bool(self._guild_db.bump_on_thread_message)
-        await self._cog._do_create_space(interaction, name, self._guild_db, bump, bump_thread)
+        bump = (
+            self.bump_checkbox.value
+            if self.bump_checkbox.value is not None
+            else bool(self._guild_db.bump_on_message)
+        )
+        bump_thread = (
+            self.bump_thread_checkbox.value
+            if self.bump_thread_checkbox.value is not None
+            else bool(self._guild_db.bump_on_thread_message)
+        )
+        await self._cog._do_create_space(
+            interaction, name, self._guild_db, bump, bump_thread
+        )
 
 
 # ---------------------------------------------------------------------------
-# RenameModal — DesignerModal for renaming a space
+# ManageSpaceModal — single-form management for a space
 # ---------------------------------------------------------------------------
 
-class RenameModal(discord.ui.DesignerModal):
-    def __init__(self, channel):
-        self._channel = channel
+class ManageSpaceModal(discord.ui.DesignerModal):
+    """
+    Single modal form to manage a space: rename, bump toggles, reset permissions,
+    and ownership transfer — all applied atomically on submit.
+    """
+
+    def __init__(self, channel, space_db, guild_db):
+        self.channel = channel
+        self.space_db = space_db
+        self.guild_db = guild_db
+
         self.name_input = discord.ui.InputText(
-            placeholder="Enter a new name for your space",
-            required=True,
+            required=False,
             max_length=100,
             value=channel.name,
         )
+        self.settings = discord.ui.CheckboxGroup(
+            options=[
+                discord.CheckboxGroupOption(
+                    label="Bump on new message",
+                    value="bump_msg",
+                    default=bool(space_db.bump_on_message),
+                ),
+                discord.CheckboxGroupOption(
+                    label="Bump on thread message",
+                    value="bump_thread",
+                    default=bool(space_db.bump_on_thread_message),
+                ),
+                discord.CheckboxGroupOption(
+                    label="Reset permissions to default",
+                    value="reset",
+                    description="Re-applies the default owner / whitelist permissions",
+                    default=False,
+                ),
+            ],
+            required=False,
+            min_values=0,
+            max_values=3,
+        )
+        self.transfer = discord.ui.UserSelect(required=False, max_values=1)
+
         super().__init__(
-            discord.ui.Label("New name", self.name_input),
-            title="Rename Space",
+            discord.ui.Label("Name", self.name_input),
+            discord.ui.Label("Settings", self.settings),
+            discord.ui.Label("Transfer ownership (optional)", self.transfer),
+            title=f"Manage Space",
         )
 
     async def callback(self, interaction):
-        new_name = self.name_input.value
-        try:
-            await self._channel.edit(name=new_name)
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description=f"Space renamed to **{new_name}**.",
-                    color=discord.Colour.green(),
-                ),
-                ephemeral=True,
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Missing permissions to rename this channel.",
-                    color=discord.Colour.red(),
-                ),
-                ephemeral=True,
-            )
+        guild = interaction.guild
+        changes = []
 
+        selected = set(self.settings.values or [])
 
-# ---------------------------------------------------------------------------
-# ManageSpaceView — interactive management panel for a space
-# ---------------------------------------------------------------------------
-
-def _manage_embed(space_channel, space_db):
-    bump_msg = "✓ Yes" if space_db.bump_on_message else "✗ No"
-    bump_thread = "✓ Yes" if space_db.bump_on_thread_message else "✗ No"
-    return discord.Embed(
-        title=f"Manage: #{space_channel.name}",
-        description=(
-            f"**Owner:** <@{space_db.owner_id}>\n"
-            f"**Bump on message:** {bump_msg}\n"
-            f"**Bump on threads:** {bump_thread}"
-        ),
-    ).set_footer(text="Changes are saved immediately · Panel expires in 3 minutes")
-
-
-class ManageSpaceView(discord.ui.View):
-    """
-    Stateful ephemeral panel for space owners / admins to manage a space.
-
-    Supports:
-      - Toggle bump-on-message
-      - Toggle bump-on-thread-message
-      - Restore default permissions
-      - Rename (opens RenameModal)
-      - Transfer ownership (UserSelect)
-    """
-
-    def __init__(self, cog, space_channel, space_db, invoker_id):
-        super().__init__(timeout=180)
-        self._cog = cog
-        self.channel = space_channel
-        self.space_db = space_db
-        self.invoker_id = invoker_id
-        self._sync_buttons()
-
-    def _sync_buttons(self):
-        """Update bump toggle button labels/styles to reflect current DB state."""
-        for item in self.children:
-            if hasattr(item, "custom_id"):
-                if item.custom_id == "toggle_bump_msg":
-                    if self.space_db.bump_on_message:
-                        item.label = "✓ Bump: messages ON"
-                        item.style = discord.ButtonStyle.success
-                    else:
-                        item.label = "✗ Bump: messages OFF"
-                        item.style = discord.ButtonStyle.secondary
-                elif item.custom_id == "toggle_bump_thread":
-                    if self.space_db.bump_on_thread_message:
-                        item.label = "✓ Bump: threads ON"
-                        item.style = discord.ButtonStyle.success
-                    else:
-                        item.label = "✗ Bump: threads OFF"
-                        item.style = discord.ButtonStyle.secondary
-
-    async def interaction_check(self, interaction):
-        if not await _user_may_manage(interaction, self.space_db):
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="You don't have permission to manage this space.",
-                    color=discord.Colour.red(),
-                ),
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    @discord.ui.button(
-        label="✓ Bump: messages ON",
-        style=discord.ButtonStyle.success,
-        custom_id="toggle_bump_msg",
-        row=0,
-    )
-    async def toggle_bump_msg(self, button, interaction):
-        await self.space_db.set_bump(not self.space_db.bump_on_message)
-        self._sync_buttons()
-        await interaction.response.edit_message(
-            embed=_manage_embed(self.channel, self.space_db), view=self
-        )
-
-    @discord.ui.button(
-        label="✓ Bump: threads ON",
-        style=discord.ButtonStyle.success,
-        custom_id="toggle_bump_thread",
-        row=0,
-    )
-    async def toggle_bump_thread(self, button, interaction):
-        await self.space_db.set_bump_thread(not self.space_db.bump_on_thread_message)
-        self._sync_buttons()
-        await interaction.response.edit_message(
-            embed=_manage_embed(self.channel, self.space_db), view=self
-        )
-
-    @discord.ui.button(
-        label="Restore Permissions",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def restore_permissions(self, button, interaction):
-        guild_db = Guild()
-        await guild_db.async_init(self.channel.guild.id)
-        if not guild_db.exists:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Server config not found.",
-                    color=discord.Colour.red(),
-                ),
-                ephemeral=True,
-            )
-            return
-        owner = self.channel.guild.get_member(self.space_db.owner_id)
-        if owner is None:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Space owner is not in the server.",
-                    color=discord.Colour.red(),
-                ),
-                ephemeral=True,
-            )
-            return
-        from cogs.space import space_overwrites
-        try:
-            await self.channel.edit(
-                overwrites=space_overwrites(owner, self.channel.guild, guild_db.whitelisted_role_ids)
-            )
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description=f"Permissions restored for {self.channel.mention}.",
-                    color=discord.Colour.green(),
-                ),
-                ephemeral=True,
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Missing permissions to edit this channel.",
-                    color=discord.Colour.red(),
-                ),
-                ephemeral=True,
-            )
-
-    @discord.ui.button(
-        label="Rename",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def rename(self, button, interaction):
-        await interaction.response.send_modal(RenameModal(self.channel))
-
-    @discord.ui.user_select(
-        placeholder="Transfer ownership to…",
-        min_values=1,
-        max_values=1,
-        row=2,
-    )
-    async def transfer_ownership(self, select, interaction):
-        new_owner = select.values[0]
-        if new_owner.bot:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Cannot transfer ownership to a bot.",
-                    color=discord.Colour.red(),
-                ),
-                ephemeral=True,
-            )
-            return
-        await self.space_db.set_owner(new_owner.id)
-
-        guild_db = Guild()
-        await guild_db.async_init(self.channel.guild.id)
-        if guild_db.exists:
-            from cogs.space import space_overwrites
+        # Rename
+        new_name = (self.name_input.value or "").strip()
+        if new_name and new_name != self.channel.name:
             try:
-                await self.channel.edit(
-                    overwrites=space_overwrites(new_owner, self.channel.guild, guild_db.whitelisted_role_ids)
-                )
+                await self.channel.edit(name=new_name)
+                changes.append(f"renamed to **{new_name}**")
             except discord.Forbidden:
-                pass
+                changes.append("⚠️ failed to rename (missing permissions)")
 
-        await interaction.response.edit_message(
-            embed=_manage_embed(self.channel, self.space_db), view=self
+        # Bump toggles
+        bump_msg = "bump_msg" in selected
+        bump_thread = "bump_thread" in selected
+        if bump_msg != bool(self.space_db.bump_on_message):
+            await self.space_db.set_bump(bump_msg)
+            changes.append(f"bump on message → **{'on' if bump_msg else 'off'}**")
+        if bump_thread != bool(self.space_db.bump_on_thread_message):
+            await self.space_db.set_bump_thread(bump_thread)
+            changes.append(
+                f"bump on thread message → **{'on' if bump_thread else 'off'}**"
+            )
+
+        # Ownership transfer
+        new_owner = self.transfer.values[0] if self.transfer.values else None
+        if new_owner is not None:
+            if new_owner.bot:
+                changes.append("⚠️ cannot transfer ownership to a bot")
+            elif new_owner.id != self.space_db.owner_id:
+                await self.space_db.set_owner(new_owner.id)
+                changes.append(f"ownership transferred to {new_owner.mention}")
+                # Apply default permissions for the new owner unless reset will run anyway
+                if "reset" not in selected:
+                    member = guild.get_member(new_owner.id)
+                    if member:
+                        try:
+                            await self.channel.edit(
+                                overwrites=space_overwrites(
+                                    member, guild, self.guild_db.whitelisted_role_ids
+                                )
+                            )
+                        except discord.Forbidden:
+                            pass
+
+        # Reset permissions
+        if "reset" in selected:
+            owner = guild.get_member(self.space_db.owner_id)
+            if owner:
+                try:
+                    await self.channel.edit(
+                        overwrites=space_overwrites(
+                            owner, guild, self.guild_db.whitelisted_role_ids
+                        )
+                    )
+                    changes.append("permissions reset to default")
+                except discord.Forbidden:
+                    changes.append("⚠️ failed to reset permissions")
+            else:
+                changes.append("⚠️ owner not in server; permissions not reset")
+
+        if not changes:
+            description = "No changes were made."
+            color = discord.Colour.blurple()
+        else:
+            description = f"Updated {self.channel.mention}:\n" + "\n".join(
+                f"• {c}" for c in changes
+            )
+            color = discord.Colour.green()
+
+        await interaction.response.send_message(
+            embed=discord.Embed(description=description, color=color),
+            ephemeral=True,
         )
-
-    async def on_timeout(self):
-        self.disable_all_items()
-        if self.message:
-            try:
-                await self.message.edit(
-                    embed=discord.Embed(
-                        description="Panel expired. Run `/space manage` again to reopen."
-                    ),
-                    view=self,
-                )
-            except discord.HTTPException:
-                pass
