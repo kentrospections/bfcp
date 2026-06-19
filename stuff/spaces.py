@@ -49,6 +49,24 @@ def space_overwrites(owner, guild, whitelisted_role_ids):
     return overwrites
 
 
+def overwrites_match(current, expected):
+    """
+    Deterministically compare two {target: PermissionOverwrite} dicts by their
+    actual (allow, deny) permission bits, keyed by target id. Avoids relying on
+    PermissionOverwrite object identity/equality so housekeeping reliably skips
+    spaces whose permissions already match.
+    """
+
+    def normalize(overwrites):
+        result = {}
+        for target, overwrite in overwrites.items():
+            allow, deny = overwrite.pair()
+            result[target.id] = (allow.value, deny.value)
+        return result
+
+    return normalize(current) == normalize(expected)
+
+
 def is_dead(owner_member, activity_ts, now):
     """
     A space is dead if its owner is no longer in the server, or it has had no

@@ -5,6 +5,7 @@ from stuff.spaces import (
     build_active_threads_by_parent,
     is_dead,
     latest_activity,
+    overwrites_match,
     pinned_in_order,
     space_overwrites,
 )
@@ -147,7 +148,7 @@ async def run_housekeeping(bot, guild, guild_db, progress=None):
         if owner is None:
             continue
         expected = space_overwrites(owner, guild, guild_db.whitelisted_role_ids)
-        if channel.overwrites != expected:
+        if not overwrites_match(channel.overwrites, expected):
             try:
                 await channel.edit(overwrites=expected)
                 summary["perms_fixed"] += 1
