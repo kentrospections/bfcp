@@ -275,6 +275,7 @@ class Space:
         self.bump_on_thread_message = None
         self.exists = False
 
+    @staticmethod
     async def add(data):
         async with aiosqlite.connect("data/database.db") as db:
             await db.execute(
@@ -356,7 +357,7 @@ class Space:
             await ctx.send_followup(
                 embed=discord.Embed(
                     description=f"You do not own <#{self.space_id}>.",
-                    color=discord.Colour.green(),
+                    color=discord.Colour.red(),
                 )
             )
             return False
