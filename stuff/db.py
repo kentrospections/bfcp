@@ -32,10 +32,32 @@ async def initialize_db():
                     pinned_channel_ids TEXT,
                     whitelisted_role_ids TEXT,
                     bump_on_message INTEGER,
-                    bump_on_thread_message INTEGER
+                    bump_on_thread_message INTEGER,
+                    dead_space_category_id INTEGER,
+                    dead_pinned_channel_ids TEXT DEFAULT '[]',
+                    auto_housekeeping INTEGER DEFAULT 1,
+                    housekeeping_hour INTEGER DEFAULT 0
                 );
             """
         )
+
+        # Idempotent migration: add any columns missing from older databases.
+        async with db.execute("PRAGMA table_info(guilds)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+        migrations = {
+            "dead_space_category_id": "INTEGER",
+            "dead_pinned_channel_ids": "TEXT DEFAULT '[]'",
+            "auto_housekeeping": "INTEGER DEFAULT 1",
+            "housekeeping_hour": "INTEGER DEFAULT 0",
+        }
+        for column, definition in migrations.items():
+            if column not in existing_columns:
+                await db.execute(
+                    f"ALTER TABLE guilds ADD COLUMN {column} {definition}"
+                )
+                logger.info(f"Migrated guilds table: added column {column}.")
+
+        await db.commit()
 
 
 # Add guild to database
@@ -47,7 +69,25 @@ async def initialize_guild(guild):
             row = await cursor.fetchone()
             if row is None:
                 await db.execute(
-                    "INSERT INTO guilds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    """
+                        INSERT INTO guilds (
+                            guild_id,
+                            greet_channel_id,
+                            greet_message,
+                            greet_attachments,
+                            space_category_id,
+                            space_owner_role_id,
+                            max_spaces_per_owner,
+                            pinned_channel_ids,
+                            whitelisted_role_ids,
+                            bump_on_message,
+                            bump_on_thread_message,
+                            dead_space_category_id,
+                            dead_pinned_channel_ids,
+                            auto_housekeeping,
+                            housekeeping_hour
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     (
                         guild.id,
                         None,
@@ -60,10 +100,24 @@ async def initialize_guild(guild):
                         json.dumps([]),
                         True,
                         True,
+                        None,
+                        json.dumps([]),
+                        True,
+                        0,
                     ),
                 )
                 await db.commit()
                 logger.info(f"Added {guild.name} (ID {guild.id}) to database.")
+
+
+# Get all (space_id, owner_id) pairs for a guild
+async def all_guild_spaces(guild_id):
+    async with aiosqlite.connect("data/database.db") as db:
+        async with db.execute(
+            "SELECT space_id, owner_id FROM spaces WHERE guild_id = ?",
+            (guild_id,),
+        ) as cursor:
+            return await cursor.fetchall()
 
 
 # Get greetings attachments for autocomplete
@@ -86,6 +140,10 @@ class Guild:
         self.whitelisted_role_ids = []
         self.bump_on_message = None
         self.bump_on_thread_message = None
+        self.dead_space_category_id = None
+        self.dead_pinned_channel_ids = []
+        self.auto_housekeeping = None
+        self.housekeeping_hour = None
         self.exists = False
 
     async def async_init(self, guild_id):
@@ -107,6 +165,10 @@ class Guild:
                     self.whitelisted_role_ids = json.loads(row[8])
                     self.bump_on_message = row[9]
                     self.bump_on_thread_message = row[10]
+                    self.dead_space_category_id = row[11]
+                    self.dead_pinned_channel_ids = json.loads(row[12] or "[]")
+                    self.auto_housekeeping = row[13]
+                    self.housekeeping_hour = row[14]
                     self.exists = True
 
     async def set_greet_channel(self, channel_id):
@@ -155,6 +217,53 @@ class Guild:
             )
             await db.commit()
             self.space_category_id = category_id
+
+    async def set_dead_category(self, category_id):
+        async with aiosqlite.connect("data/database.db") as db:
+            await db.execute(
+                "UPDATE guilds SET dead_space_category_id = ? WHERE guild_id = ?",
+                (category_id, self.guild_id),
+            )
+            await db.commit()
+            self.dead_space_category_id = category_id
+
+    async def add_to_dead_pinned(self, channel_id):
+        if channel_id not in self.dead_pinned_channel_ids:
+            self.dead_pinned_channel_ids.append(channel_id)
+            async with aiosqlite.connect("data/database.db") as db:
+                await db.execute(
+                    "UPDATE guilds SET dead_pinned_channel_ids = ? WHERE guild_id = ?",
+                    (json.dumps(self.dead_pinned_channel_ids), self.guild_id),
+                )
+                await db.commit()
+
+    async def remove_from_dead_pinned(self, channel_id):
+        if channel_id in self.dead_pinned_channel_ids:
+            self.dead_pinned_channel_ids.remove(channel_id)
+            async with aiosqlite.connect("data/database.db") as db:
+                await db.execute(
+                    "UPDATE guilds SET dead_pinned_channel_ids = ? WHERE guild_id = ?",
+                    (json.dumps(self.dead_pinned_channel_ids), self.guild_id),
+                )
+                await db.commit()
+
+    async def set_auto_housekeeping(self, value):
+        async with aiosqlite.connect("data/database.db") as db:
+            await db.execute(
+                "UPDATE guilds SET auto_housekeeping = ? WHERE guild_id = ?",
+                (value, self.guild_id),
+            )
+            await db.commit()
+            self.auto_housekeeping = value
+
+    async def set_housekeeping_hour(self, value):
+        async with aiosqlite.connect("data/database.db") as db:
+            await db.execute(
+                "UPDATE guilds SET housekeeping_hour = ? WHERE guild_id = ?",
+                (value, self.guild_id),
+            )
+            await db.commit()
+            self.housekeeping_hour = value
 
     async def set_owner_role(self, role_id):
         async with aiosqlite.connect("data/database.db") as db:
@@ -281,6 +390,18 @@ class Space:
             await db.execute(
                 "INSERT INTO spaces VALUES (?, ?, ?, ?, ?)",
                 data,
+            )
+            await db.commit()
+
+    @staticmethod
+    async def delete_many(space_ids):
+        if not space_ids:
+            return
+        async with aiosqlite.connect("data/database.db") as db:
+            params = ", ".join("?" * len(space_ids))
+            await db.execute(
+                f"DELETE FROM spaces WHERE space_id IN ({params})",
+                tuple(space_ids),
             )
             await db.commit()
 

@@ -1,10 +1,62 @@
-import time
 from datetime import timedelta
 
 import discord
 
 ARCHIVED_THREAD_LIMIT = 50
 ACTIVITY_LOOKBACK = timedelta(days=30)
+
+
+def space_overwrites(owner, guild, whitelisted_role_ids):
+    """
+    Build Discord permission overwrites for a space channel.
+
+    Owner gets full control. If whitelisted roles exist, @everyone is denied
+    access and those roles are granted view access. Otherwise @everyone can
+    view but not send messages.
+
+    Note: `owner` may be a Member or User; resolve to Member for role checks.
+    """
+    member = guild.get_member(owner.id) if not isinstance(owner, discord.Member) else owner
+
+    overwrites = {
+        owner: discord.PermissionOverwrite(
+            view_channel=True,
+            manage_channels=True,
+            manage_permissions=True,
+            manage_webhooks=True,
+            read_messages=True,
+            send_messages=True,
+        )
+    }
+
+    override_roles = [
+        r
+        for role_id in whitelisted_role_ids
+        if (r := guild.get_role(role_id)) and member and r in member.roles
+    ]
+
+    if override_roles:
+        overwrites[guild.default_role] = discord.PermissionOverwrite(
+            view_channel=False, send_messages=False
+        )
+        for role in override_roles:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True)
+    else:
+        overwrites[guild.default_role] = discord.PermissionOverwrite(
+            send_messages=False
+        )
+
+    return overwrites
+
+
+def is_dead(owner_member, activity_ts, now):
+    """
+    A space is dead if its owner is no longer in the server, or it has had no
+    activity within ACTIVITY_LOOKBACK.
+    """
+    if owner_member is None:
+        return True
+    return activity_ts < now - ACTIVITY_LOOKBACK
 
 
 def _msg_time(last_message_id):
@@ -105,23 +157,3 @@ def bump_slot(category, pinned_ids):
     if not category.channels:
         return 0
     return category.channels[0].position + pinned_count
-
-
-async def throttled_progress(ctx, current, total, channel_name, last_edit_ref):
-    """
-    Edit the deferred interaction response with sort progress.
-    `last_edit_ref` is a single-element list [float] used as a mutable reference
-    to track the last edit timestamp.
-    Rate-limits edits to ~1 per 1.5 seconds, always emitting first and last.
-    """
-    now = time.monotonic()
-    if current == 1 or current == total or now - last_edit_ref[0] > 1.5:
-        last_edit_ref[0] = now
-        try:
-            await ctx.interaction.edit_original_response(
-                embed=discord.Embed(
-                    description=f"⏳ Processing {current}/{total}  ·  {channel_name}",
-                )
-            )
-        except discord.HTTPException:
-            pass
